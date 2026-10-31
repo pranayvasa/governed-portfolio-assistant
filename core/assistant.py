@@ -15,9 +15,11 @@ NOT_COVERED = (
     f"For anything beyond {_P['possessive']} resume and writing, "
     f"connect with {_P['object']} on LinkedIn: {config.LINKEDIN_URL}"
 )
+# The index is missing, or the Gemini circuit breaker is open (a key, billing
+# or quota error): asking again in a moment won't help, so say so.
 UNAVAILABLE = (
-    "The assistant is unavailable right now. "
-    f"Please try again later, or connect with {_NAME} on LinkedIn: {config.LINKEDIN_URL}"
+    "Chat is temporarily unavailable. "
+    f"You can reach {_NAME} on LinkedIn: {config.LINKEDIN_URL}"
 )
 # Both Gemini models failed or were overloaded. The bot fails closed: no
 # weaker model answers in their place.
@@ -48,6 +50,9 @@ def answer(question: str, history: list[dict] | None = None) -> Answer:
     with user turns holding only the bare question (no retrieved context)."""
     start = time.monotonic()
     history = _trim_history(history or [])
+    if llm.paused():
+        # Gemini rejected an earlier call for a reason a retry won't fix.
+        return Answer(UNAVAILABLE, "unavailable", latency_ms=_ms(start))
 
     try:
         result = retrieval.retrieve(question)
@@ -81,6 +86,8 @@ def answer(question: str, history: list[dict] | None = None) -> Answer:
     deadline = start + config.GENERATION_DEADLINE_S
     last_failed_fast = False
     for provider, model, cap, reserve, only_after_fast_fail in _attempts():
+        if llm.paused():
+            break
         if only_after_fast_fail:
             if not last_failed_fast:
                 continue
@@ -96,6 +103,8 @@ def answer(question: str, history: list[dict] | None = None) -> Answer:
             continue
         text, cited = guardrails.finalise_answer(raw, sources)
         return Answer(text, "answered", provider=provider, sources=cited, **meta, latency_ms=_ms(start))
+    if llm.paused():
+        return Answer(UNAVAILABLE, "unavailable", **meta, latency_ms=_ms(start))
     return Answer(BUSY, "busy", **meta, latency_ms=_ms(start))
 
 

@@ -22,12 +22,57 @@ class LLMError(Exception):
         self.status = status
 
 
-def _post(provider: str, url: str, headers: dict, body: dict, timeout: float) -> dict:
+# --- Circuit breaker --------------------------------------------------------
+# Some errors won't clear on a retry: a rejected or restricted key, a billing
+# or account problem (401/403, or a 400 about the key or a failed
+# precondition), or an exhausted quota (429). Repeating them on every
+# visitor's question just sends Google a stream of failing calls, so this
+# instance stops calling Gemini for a while and the bot says chat is
+# temporarily unavailable. A 500/503 ("overloaded") is ordinary and doesn't
+# trip it: those still go to the backup model, then "busy".
+ACCOUNT_PAUSE_S = 600
+QUOTA_PAUSE_S = 60
+_paused_until = 0.0
+
+
+def paused(now: float | None = None) -> bool:
+    """True while the breaker is open and guarded calls are skipped."""
+    return (now or time.time()) < _paused_until
+
+
+def _pause_for(status: int, resp) -> float:
+    """Seconds to pause after this error response (0: don't pause). Google's
+    error status and message are read only to classify the error; they are
+    never stored or logged."""
+    if status in (401, 403):
+        return ACCOUNT_PAUSE_S
+    try:
+        err = resp.json().get("error", {})
+        text = f"{err.get('status', '')} {err.get('message', '')}".lower()
+    except (ValueError, AttributeError):
+        text = ""
+    if status == 400 and any(w in text for w in ("api key", "api_key", "failed_precondition", "billing")):
+        return ACCOUNT_PAUSE_S
+    if status == 429:
+        return ACCOUNT_PAUSE_S if "suspend" in text else QUOTA_PAUSE_S
+    return 0
+
+
+def _post(provider: str, url: str, headers: dict, body: dict, timeout: float, guarded: bool = True) -> dict:
+    """POST to Gemini. `guarded` calls (everything the live API makes) are
+    skipped while the breaker is open and can open it; the offline index
+    build isn't guarded, so its own retries and back-off still work."""
+    global _paused_until
+    if guarded and paused():
+        raise LLMError(provider, 0, "paused")
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=timeout)
     except requests.RequestException as exc:
         raise LLMError(provider, 0, type(exc).__name__) from None
     if resp.status_code != 200:
+        pause = _pause_for(resp.status_code, resp) if guarded else 0
+        if pause:
+            _paused_until = max(_paused_until, time.time() + pause)
         raise LLMError(provider, resp.status_code, "non-200 response")
     return resp.json()
 
@@ -41,8 +86,9 @@ def _normalise(vec: list[float]) -> list[float]:
 
 # --- Embeddings -------------------------------------------------------------
 
-def embed(texts: list[str], retries: int = 3, timeout: float = 60) -> list[list[float]]:
-    """Embed already-formatted texts (see EMBED_*_FORMAT). Batches of 100."""
+def embed(texts: list[str], retries: int = 3, timeout: float = 60, guarded: bool = False) -> list[list[float]]:
+    """Embed already-formatted texts (see EMBED_*_FORMAT). Batches of 100.
+    `guarded` puts the call behind the circuit breaker (see _post)."""
     key = config.gemini_key()
     if not key:
         raise LLMError("gemini-embed", 0, "GEMINI_API_KEY not set")
@@ -63,7 +109,7 @@ def embed(texts: list[str], retries: int = 3, timeout: float = 60) -> list[list[
         }
         for attempt in range(retries + 1):
             try:
-                data = _post("gemini-embed", url, headers, body, timeout)
+                data = _post("gemini-embed", url, headers, body, timeout, guarded=guarded)
                 break
             except LLMError as exc:
                 # Retry rate limits and server errors (only matters for the
@@ -77,7 +123,7 @@ def embed(texts: list[str], retries: int = 3, timeout: float = 60) -> list[list[
 
 def embed_query(question: str) -> list[float]:
     text = config.EMBED_QUERY_FORMAT.format(text=question)
-    return embed([text], retries=0, timeout=config.EMBED_TIMEOUT_S)[0]
+    return embed([text], retries=0, timeout=config.EMBED_TIMEOUT_S, guarded=True)[0]
 
 
 # --- Generation -------------------------------------------------------------

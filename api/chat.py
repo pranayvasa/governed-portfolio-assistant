@@ -23,13 +23,19 @@ from core import assistant, config, guardrails, limits  # noqa: E402
 MAX_BODY_BYTES = 16_384
 
 RATE_LIMITED = (
-    "You've sent a lot of questions in a short time. Please wait a minute and try again, "
+    "You've sent a lot of questions in a short time. Please wait a few minutes and try again, "
     f"or connect with {config.PERSONA_SHORT} on LinkedIn: {config.LINKEDIN_URL}"
 )
 SESSION_LIMIT = (
     f"You've reached the limit of {limits.SESSION_MAX_QUESTIONS} questions for this session. "
     f"To continue the conversation, connect with {config.PERSONA_SHORT} on LinkedIn: {config.LINKEDIN_URL}"
 )
+DAILY_LIMIT = (
+    "The assistant has answered as many questions as it can for today. Please try again tomorrow, "
+    f"or connect with {config.PERSONA_SHORT} on LinkedIn: {config.LINKEDIN_URL}"
+)
+# Header the live test battery sends to skip the per-IP limit (see limits.battery_bypass).
+BATTERY_HEADER = "x-battery-token"
 
 # Optional, comma-separated. Leave unset when the page and API share an origin.
 ALLOWED_ORIGINS = {o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()}
@@ -76,7 +82,8 @@ class handler(BaseHTTPRequestHandler):
         except guardrails.InvalidInput as exc:
             return 400, {"answer": str(exc), "status": "invalid"}, {}
 
-        if not limits.allow_ip(_client_ip(self.headers)):
+        battery = limits.battery_bypass(self.headers.get(BATTERY_HEADER))
+        if not battery and not limits.allow_ip(_client_ip(self.headers)):
             return 429, {"answer": RATE_LIMITED, "status": "rate_limited"}, {}
 
         asked = limits.read_session(body.get("session"))
@@ -87,6 +94,10 @@ class handler(BaseHTTPRequestHandler):
                 "session": body.get("session"),
                 "remaining": 0,
             }, {}
+
+        # Counted last, so rejected requests don't use up the day's allowance.
+        if not limits.allow_daily():
+            return 429, {"answer": DAILY_LIMIT, "status": "daily_limit"}, {}
 
         history = guardrails.clean_history(body.get("history"))
         ans = assistant.answer(question, history)
@@ -100,7 +111,7 @@ class handler(BaseHTTPRequestHandler):
             "session": limits.next_session(asked),
             "remaining": limits.SESSION_MAX_QUESTIONS - asked,
         }
-        meta = {"provider": ans.provider, "retrieval": ans.retrieval_method}
+        meta = {"provider": ans.provider, "retrieval": ans.retrieval_method, "battery": battery}
         return code, payload, meta
 
     # --- plumbing -----------------------------------------------------------

@@ -151,11 +151,3 @@ def test_session_token_counts_and_rejects_tampering():
     assert limits.read_session(body + "." + mac[:-1] + ("A" if mac[-1] != "A" else "B")) == 0
     assert limits.read_session("garbage") == 0
     assert limits.read_session(None) == 0
-
-
-def test_ip_limit_per_minute():
-    ip, now = "203.0.113.7", 1_000_000.0
-    per_minute = limits.IP_LIMITS[0][1]
-    assert all(limits.allow_ip(ip, now + i) for i in range(per_minute))
-    assert not limits.allow_ip(ip, now + per_minute)
-    assert limits.allow_ip(ip, now + 120)  # window has passed

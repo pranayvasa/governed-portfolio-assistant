@@ -1,13 +1,17 @@
-"""Abuse limits for the public endpoint: per-session and per-IP.
+"""Abuse limits for the public endpoint: per-session, per-IP and per-day.
 
 Session cap (20 questions): the server issues an HMAC-signed token holding a
 counter; the client sends it back with each question. No server storage. A
 client can drop the token to start over, which is what the per-IP limit is for.
 
-Per-IP limit: an in-memory sliding window. Each serverless instance keeps its
-own window, so this is a basic brake, not a hard guarantee. The hard ceiling
-is the free-tier quota itself: with no billing account attached, abuse can
-only exhaust quota, never cost money.
+Per-IP limit (10 per 10 minutes, 30 per hour): an in-memory sliding window.
+Each serverless instance keeps its own window, so this is a brake, not a hard
+guarantee. The live test battery can skip it by sending the BATTERY_TOKEN
+secret (see battery_bypass).
+
+Daily cap (300 questions per instance per 24 hours): a ceiling on how many
+questions one instance sends to Gemini, whoever asks them. It also bounds
+spend if the per-IP limit is spread across many addresses.
 
 IPs are held in memory only for the window and are never logged.
 """
@@ -24,7 +28,9 @@ from collections import defaultdict, deque
 
 SESSION_MAX_QUESTIONS = 20
 SESSION_TTL_S = 24 * 3600
-IP_LIMITS = ((60, 8), (3600, 60))  # (window seconds, max requests)
+IP_LIMITS = ((600, 10), (3600, 30))  # (window seconds, max requests)
+DAILY_MAX_QUESTIONS = 300  # per instance, per rolling 24 hours
+DAY_S = 24 * 3600
 
 
 # --- Session token ----------------------------------------------------------
@@ -97,4 +103,33 @@ def allow_ip(ip: str, now: float | None = None) -> bool:
         if len(_hits) > 10_000:
             for k in [k for k, v in _hits.items() if not v or now - v[-1] > longest]:
                 del _hits[k]
+        return True
+
+
+# --- Battery bypass ---------------------------------------------------------
+
+def battery_bypass(token) -> bool:
+    """True when the request carries the BATTERY_TOKEN secret, so the live test
+    battery (about 45 questions from one IP) isn't blocked by the per-IP limit.
+    Off unless BATTERY_TOKEN is set. The daily cap still applies."""
+    secret = os.environ.get("BATTERY_TOKEN")
+    if not secret or not isinstance(token, str) or not token:
+        return False
+    return hmac.compare_digest(token.encode(), secret.encode())
+
+
+# --- Daily cap per instance -------------------------------------------------
+
+_day: deque = deque()
+
+
+def allow_daily(now: float | None = None) -> bool:
+    """Count one question toward this instance's 24-hour cap, if there's room."""
+    now = now or time.time()
+    with _lock:
+        while _day and now - _day[0] > DAY_S:
+            _day.popleft()
+        if len(_day) >= DAILY_MAX_QUESTIONS:
+            return False
+        _day.append(now)
         return True

@@ -9,13 +9,17 @@ answer to governance/test_runs/<date>-<time>.md for manual review.
 Tests without an automated check are marked REVIEW: the corpus owner judges
 those by hand against the battery's pass/fail criteria and fills in the results log.
 
-Paced to stay under the endpoint's per-IP rate limit (8/minute, 60/hour),
-so a full run takes a few minutes and back-to-back runs may be throttled.
+The endpoint allows 10 questions per IP per 10 minutes, fewer than one run
+asks. Set BATTERY_TOKEN (in the environment or .env) to the same secret as
+the deployment's BATTERY_TOKEN and the runner sends it to skip the per-IP
+limit; the endpoint's daily cap still applies. Without it, a run is cut short
+with rate_limited answers. Paced at one question every 10 seconds.
 """
 
 import argparse
 import importlib.util
 import json
+import os
 import re
 import sys
 import time
@@ -27,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core import guardrails  # noqa: E402
+from core import config, guardrails  # noqa: E402
 BATTERY = ROOT / "governance" / "test_battery.md"
 OUT_DIR = ROOT / "governance" / "test_runs"
 PACE_S = 10
@@ -59,11 +63,21 @@ def load_battery() -> list[dict]:
     return tests
 
 
+def _battery_headers() -> dict:
+    """The per-IP-limit bypass header, if BATTERY_TOKEN is set here."""
+    config.load_dotenv()
+    token = os.environ.get("BATTERY_TOKEN")
+    return {"X-Battery-Token": token} if token else {}
+
+
+BATTERY_HEADERS = _battery_headers()
+
+
 def ask(base_url: str, question: str) -> dict:
     req = urllib.request.Request(
         base_url.rstrip("/") + "/api/chat",
         data=json.dumps({"question": question}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **BATTERY_HEADERS},
     )
     start = time.monotonic()
     try:

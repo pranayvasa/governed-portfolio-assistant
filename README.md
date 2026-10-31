@@ -52,7 +52,8 @@ flowchart LR
 | **Prompt-injection handling.** Retrieved text is wrapped as data, not instructions. Requests to ignore the rules, change role or reveal the prompt are declined. | System prompt, *Instruction integrity*; [`core/prompt.py`](core/prompt.py) |
 | **Output guardrails.** HTML and every link except the persona's contact link are stripped; the Sources line is rebuilt from real corpus source names (invented sources are dropped); pure refusals carry no Sources line. | [`core/guardrails.py`](core/guardrails.py) |
 | **No content logging.** One log line per request: status code, outcome, model used, retrieval method and latency. Never the question, the answer, the history or the IP. | [`api/chat.py`](api/chat.py) |
-| **Abuse limits.** 500 characters per question; 20 questions per session (an HMAC-signed counter, no server storage); a per-IP limit per minute and per hour. Use a key on prepaid credits with auto-reload off, or the free tier, so abuse can't run up a bill. | [`core/limits.py`](core/limits.py) |
+| **Abuse limits.** 500 characters per question; 20 questions per session (an HMAC-signed counter, no server storage); 10 questions per IP per 10 minutes and 30 per hour; at most 300 questions a day per serverless instance; answers capped at 800 output tokens. The live battery skips the per-IP limit with a `BATTERY_TOKEN` secret, and the daily cap still applies. | [`core/limits.py`](core/limits.py) |
+| **Circuit breaker.** If Gemini rejects a call for a reason a retry won't fix (401/403, an invalid key, a billing or account problem), the instance stops calling Gemini for 10 minutes; after a quota 429, for 1 minute. Visitors see "Chat is temporarily unavailable" and the contact link, instead of every question sending Google more failing calls. | [`core/llm.py`](core/llm.py) |
 | **Browser hardening.** Strict Content-Security-Policy, no third-party scripts or fonts, model output rendered as text nodes, never as HTML. | [`vercel.json`](vercel.json), [`web/app.js`](web/app.js) |
 
 ## Testing
@@ -81,9 +82,9 @@ python -m pytest tests/       # offline, no key needed
 python scripts/dev_server.py  # http://127.0.0.1:8787
 ```
 
-`index/chunks.json` is already built from the sample corpus. After editing `corpus/`, rebuild it with `python scripts/build_index.py` (`--dry-run --show` previews the chunks without calling the API). To try the battery locally, start the dev server and run `python scripts/run_tests.py http://127.0.0.1:8787`.
+`index/chunks.json` is already built from the sample corpus. After editing `corpus/`, rebuild it with `python scripts/build_index.py` (`--dry-run --show` previews the chunks without calling the API). To try the battery locally, set `BATTERY_TOKEN` in `.env` (any long random string; the runner and the dev server both read it), start the dev server and run `python scripts/run_tests.py http://127.0.0.1:8787`. Without it, the per-IP limit of 10 questions per 10 minutes cuts the run short.
 
-To deploy, import the repository into Vercel and set `GEMINI_API_KEY` and `SESSION_SECRET` as environment variables. `vercel.json` already sets the function bundle and the security headers.
+To deploy, import the repository into Vercel and set `GEMINI_API_KEY` and `SESSION_SECRET` (and `BATTERY_TOKEN` if you'll run the battery against it) as environment variables. `vercel.json` already sets the function bundle and the security headers.
 
 ### Make it about someone else
 
@@ -99,7 +100,7 @@ To deploy, import the repository into Vercel and set `GEMINI_API_KEY` and `SESSI
 - **Model consistency.** At temperature 0, LLMs are still not fully deterministic: the same question can get a slightly different answer between runs, which is why the reviews run every question at least twice.
 - **Third-party processing.** Questions are sent to Google's Gemini API, as the page notice says.
 - **Only as current as the corpus.** The bot knows nothing that isn't in `corpus/`.
-- **Basic rate limiting.** The per-IP limit lives in each serverless instance's memory, so it is a brake rather than a guarantee.
+- **Basic rate limiting.** The per-IP limit and the daily cap live in each serverless instance's memory, so they are brakes rather than guarantees. A shared store (such as Upstash Redis) would make them exact.
 
 ## Repository layout
 
